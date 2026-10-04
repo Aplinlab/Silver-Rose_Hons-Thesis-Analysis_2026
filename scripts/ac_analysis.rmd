@@ -1,0 +1,1219 @@
+---
+title: "AC analysis - group means"
+author: "Silver Rose"
+date: "2026-08-17"
+output: word_document
+---
+
+# INITIAL SETUP
+
+```{r setup}
+# Sets the figure device and loads packages.
+knitr::opts_chunk$set(echo = TRUE, dev = "emf", fig.ext = "emf", dpi = 300)
+
+rm(list = ls())
+
+library(ggplot2)
+library(devEMF)
+library(cowplot)
+library(emmeans)
+library(lme4)
+library(lmerTest) # must load after lme4
+library(car)
+library(DHARMa)
+library(GLMMadaptive)
+
+figure_dir <- "../figures"
+dir.create(figure_dir, showWarnings = FALSE)
+
+# Saves a figure to ../figures as PNG and EMF at the chunk's figure size.
+save_figure <- function(plot, name) {
+  width  <- knitr::opts_current$get("fig.width")
+  height <- knitr::opts_current$get("fig.height")
+  ggsave(file.path(figure_dir, paste0(name, ".png")), plot,
+         width = width, height = height, dpi = 300)
+  ggsave(file.path(figure_dir, paste0(name, ".emf")), plot,
+         width = width, height = height,
+         device = function(filename, ...) devEMF::emf(file = filename, ...))
+}
+```
+
+# DATA PREPARATION
+
+Noise subtraction, artefact blanking, exclusions and normalisation of the pulse data.
+
+```{r noise-floor}
+# Builds the per-recording noise floor from the 2 mA recruitment-curve stimulus.
+noise_current_ma <- 2
+
+group_channels <- c("ADMpk2pk", "filtSNAPpk2pk", "filtelbowpk2pk")
+
+recruitment_data <- read.csv("../outputs/data/RecruitmentCurves.csv")
+
+# Sorting by `count` keeps the first 2 mA stimulus per subject x frequency.
+noise_rows <- subset(recruitment_data, currAmp == noise_current_ma)
+noise_rows <- noise_rows[order(noise_rows$subjID, noise_rows$freq, noise_rows$count), ]
+noise_floor <- noise_rows[!duplicated(noise_rows[c("subjID", "freq")]),
+                          c("subjID", "freq", group_channels)]
+
+stopifnot(!anyNA(noise_floor[group_channels]))
+```
+
+## Import and exclusions
+
+```{r import}
+# Builds `pulse_data`: noise-subtracted, artefact-blanked and with exclusions applied.
+pulse_data <- read.csv("../outputs/data/ACpulsedata.csv")
+
+noise_index <- match(paste(pulse_data$subjID, pulse_data$freq),
+                     paste(noise_floor$subjID, noise_floor$freq))
+stopifnot(!anyNA(noise_index))
+
+for (ch in group_channels)
+  pulse_data[[ch]] <- pmax(pulse_data[[ch]] - noise_floor[[ch]][noise_index], 0)
+
+tagged_areas <- read.csv("../outputs/data/tagged areas.csv")
+
+tag_channel_map <- list(ADM   = "ADMpk2pk",
+                        SNAP  = "filtSNAPpk2pk",
+                        elbow = "filtelbowpk2pk")
+
+for (i in seq_len(nrow(tagged_areas))) {
+  in_window <- pulse_data$filename == tagged_areas$filename[i] &
+               pulse_data$fileStimTime >= tagged_areas$start[i] &
+               pulse_data$fileStimTime <= tagged_areas$end[i]
+  for (grp in names(tag_channel_map))
+    if (tagged_areas[[grp]][i] == 1)
+      pulse_data[in_window, tag_channel_map[[grp]]] <- NA_real_
+}
+
+# Mean over non-NA values; NA rather than NaN when all are NA.
+safe_mean <- function(x, ...) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+
+excluded_subjects <- "S03"
+pulse_data <- subset(pulse_data, !(subjID %in% excluded_subjects))
+
+stopifnot(all(unique(pulse_data$filename) %in%
+              pulse_data$filename[pulse_data$measure == "Train"]))
+
+# Channels blanked by subject and frequency; `freq = NA` means all frequencies.
+channel_exclusions <- data.frame(
+  subjID  = c("S10",            "S05",            "S18",
+              "S18",            "S08"),
+  freq    = c(  NA,               25,              100,
+                50,              100),
+  channel = c("filtelbowpk2pk", "filtelbowpk2pk", "filtSNAPpk2pk",
+              "ADMpk2pk",       "filtSNAPpk2pk"),
+  stringsAsFactors = FALSE)
+
+for (i in seq_len(nrow(channel_exclusions))) {
+  excluded_rows <- pulse_data$subjID == channel_exclusions$subjID[i] &
+                   (is.na(channel_exclusions$freq[i]) |
+                    pulse_data$freq == channel_exclusions$freq[i])
+  pulse_data[excluded_rows, channel_exclusions$channel[i]] <- NA_real_
+}
+
+# Blanks a channel for any recording whose pre-train singles mean is below this, in mV.
+min_usable_baseline_mv <- 0.005
+
+singles_data <- subset(pulse_data, measure == "Singles")
+baseline_by_file <- aggregate(singles_data[group_channels],
+                              by = list(filename = singles_data$filename),
+                              FUN = safe_mean)
+
+for (ch in group_channels) {
+  unusable <- baseline_by_file$filename[!is.na(baseline_by_file[[ch]]) &
+                                        baseline_by_file[[ch]] < min_usable_baseline_mv]
+  pulse_data[pulse_data$filename %in% unusable, ch] <- NA_real_
+}
+```
+
+## Building the train dataset
+
+Each response is expressed as a proportion of that recording's pre-train singles mean.
+
+```{r build-traindata}
+# Builds `train_data` (one row per train pulse) with time and normalised amplitudes.
+train_data <- subset(pulse_data, measure == "Train")
+
+# Seconds since train onset.
+train_data$time <- with(train_data,
+                        ave(fileStimTime, filename, FUN = function(t) t - min(t)))
+stopifnot(abs(tapply(train_data$time, train_data$filename, max) - 239) < 1.5)
+
+singles_data <- subset(pulse_data, measure == "Singles")
+singles_baseline <- aggregate(singles_data[group_channels],
+                              by  = list(filename = singles_data$filename),
+                              FUN = safe_mean)
+
+norm_cols <- paste0(group_channels, "_norm")
+
+for (ch in group_channels) {
+  baseline_row <- match(train_data$filename, singles_baseline$filename)
+  train_data[[paste0(ch, "_norm")]] <-
+    train_data[[ch]] / singles_baseline[[ch]][baseline_row]
+}
+
+freq_cols <- c("10"  = "#1b9e77", "25"  = "#d95f02",
+               "50"  = "#7570b3", "100" = "#e7298a")
+
+channel_labels <- c(
+  ADMpk2pk       = "ADM CMAP (motor)",
+  filtSNAPpk2pk  = "filtered SNAP (sensory)",
+  filtelbowpk2pk = "filtered elbow (mixed)")
+
+channel_short <- c(
+  ADMpk2pk       = "Motor",
+  filtSNAPpk2pk  = "Sensory",
+  filtelbowpk2pk = "Mixed-nerve")
+
+figure_channel_names <- c(
+  ADMpk2pk       = "motor",
+  filtSNAPpk2pk  = "sensory",
+  filtelbowpk2pk = "mixed_nerve")
+
+title_case_label <- function(x) gsub("\\b([a-z])", "\\U\\1", x, perl = TRUE)
+
+ylab_norm <- function(ch) paste0(title_case_label(channel_labels[[ch]]),
+                                 "\nNormalised Peak-to-Peak Response")
+
+# Sensory and mixed share one y limit; motor gets its own when it is more than 1.5x taller.
+shared_y_channels  <- c("filtSNAPpk2pk", "filtelbowpk2pk")
+shared_y_ratio_cut <- 1.5
+
+family_y_limit <- function(ch_max, ch, pad = 1.05) {
+  m_shared <- max(ch_max[names(ch_max) %in% shared_y_channels], na.rm = TRUE)
+  m_all    <- max(ch_max, na.rm = TRUE)
+  if (m_all <= shared_y_ratio_cut * m_shared) return(m_all * pad)
+  if (ch %in% shared_y_channels) return(m_shared * pad)
+  ch_max[[ch]] * pad
+}
+
+# One y limit covering a group-mean frame and its single-subject counterpart.
+family_y_max_paired <- function(group_df, value_col, subject_df, ch, channels_present,
+                                suffix = "_norm", channel_col = "channel", pad = 1.05) {
+  group_max <- tapply(group_df[[value_col]], group_df[[channel_col]], max, na.rm = TRUE)
+  ch_max <- vapply(channels_present, function(k) {
+    v <- subject_df[[paste0(k, suffix)]]
+    both <- c(if (is.null(v) || all(is.na(v))) NA_real_ else max(v, na.rm = TRUE),
+              if (k %in% names(group_max)) group_max[[k]] else NA_real_)
+    if (all(is.na(both))) NA_real_ else max(both, na.rm = TRUE)
+  }, numeric(1))
+  family_y_limit(ch_max[!is.na(ch_max)], ch, pad)
+}
+
+# Y breaks from 0 with an increment that always puts a tick on 1.
+baseline_breaks <- function(y_max, target_ticks = 6) {
+  candidates <- c(0.1, 0.2, 0.25, 0.5, 1)
+  inc <- candidates[which.min(abs(y_max / candidates - target_ticks))]
+  seq(0, ceiling(y_max / inc) * inc, by = inc)
+}
+
+axis_linewidth <- 0.8
+line_data      <- 0.5
+line_baseline  <- 0.5
+line_summary   <- 0.4
+line_reference <- 0.3
+line_trace     <- 0.25
+
+manuscript_theme <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      axis.line   = element_line(linewidth = axis_linewidth, colour = "black"),
+      axis.ticks  = element_line(linewidth = axis_linewidth, colour = "black"),
+      axis.ticks.length = unit(3.5, "pt"),
+      axis.title  = element_text(size = base_size),
+      axis.text   = element_text(size = base_size - 2, colour = "black"),
+      plot.title    = element_text(size = base_size + 2, face = "bold"),
+      plot.subtitle = element_text(size = base_size - 3.5),
+      plot.caption  = element_text(size = base_size - 4.5, colour = "grey35", hjust = 0),
+      legend.title  = element_text(size = base_size - 2),
+      legend.text   = element_text(size = base_size - 3),
+      legend.key.height = unit(0.8, "lines"))
+}
+
+baseline_hline <- function(yintercept = 1) {
+  geom_hline(yintercept = yintercept, linewidth = line_baseline, colour = "grey50")
+}
+
+overlay_subject <- "S01"
+```
+
+## Per-second means of the normalised response
+
+```{r build-secmeans}
+# Builds `train_sec_means`: one row per recording x second of mean normalised response.
+train_data$sec <- floor(round(train_data$time, 6))
+
+train_sec_means <- aggregate(train_data[c("time", norm_cols)],
+                             by  = list(filename = train_data$filename,
+                                        sec      = train_data$sec),
+                             FUN = safe_mean)
+
+train_sec_means <- merge(unique(train_data[c("filename", "subjID", "freq")]),
+                         train_sec_means, by = "filename")
+
+train_sec_means <- train_sec_means[order(train_sec_means$filename, train_sec_means$sec), ]
+
+stopifnot(nrow(train_sec_means) == 240 * length(unique(train_sec_means$filename)))
+```
+
+## Recovery dataset
+
+```{r build-recovery-data}
+# Builds `recovery_data`: one row per post-train probe, normalised to the singles mean.
+recovery_data <- subset(pulse_data, measure == "Recovery")
+
+train_end_time <- tapply(train_data$fileStimTime, train_data$filename, max)
+
+recovery_data$time_s   <- recovery_data$fileStimTime -
+                          train_end_time[recovery_data$filename]
+recovery_data$time_min <- recovery_data$time_s / 60
+
+# Drops trailing probes where no stimulus was delivered.
+stopifnot(all(recovery_data$currAmp[recovery_data$time_s <= 0] == 0))
+recovery_data <- recovery_data[recovery_data$time_s > 0, ]
+
+for (ch in group_channels) {
+  baseline_row <- match(recovery_data$filename, singles_baseline$filename)
+  recovery_data[[paste0(ch, "_norm")]] <-
+    recovery_data[[ch]] / singles_baseline[[ch]][baseline_row]
+}
+
+recovery_data <- recovery_data[order(recovery_data$filename, recovery_data$time_s), ]
+```
+
+## Group means
+
+```{r build-group-means}
+# Builds `train_group_means`, `recovery_group_means` and their shared y limits.
+group_rows <- list()
+
+for (ch in group_channels) {
+  ycol <- paste0(ch, "_norm")
+  d <- train_sec_means[!is.na(train_sec_means[[ycol]]), ]
+  keys <- list(freq = d$freq, sec = d$sec)
+
+  n_df    <- aggregate(d[ycol],  by = keys, FUN = length)
+  mean_df <- aggregate(d[ycol],  by = keys, FUN = mean)
+  sd_df   <- aggregate(d[ycol],  by = keys, FUN = sd)
+  time_df <- aggregate(d["time"], by = keys, FUN = mean)
+  names(n_df)[3] <- "n"; names(mean_df)[3] <- "mean"; names(sd_df)[3] <- "sd"
+
+  g <- Reduce(function(a, b) merge(a, b, by = c("freq", "sec")),
+              list(n_df, mean_df, sd_df, time_df))
+  g$channel <- ch
+  group_rows[[ch]] <- g
+}
+
+train_group_means <- do.call(rbind, group_rows)
+
+train_group_means$se    <- with(train_group_means, sd / sqrt(n))
+train_group_means$ci_lo <- with(train_group_means, mean - qt(0.975, n - 1) * se)
+train_group_means$ci_hi <- with(train_group_means, mean + qt(0.975, n - 1) * se)
+
+train_group_means <- train_group_means[order(train_group_means$channel,
+                                             train_group_means$freq,
+                                             train_group_means$sec), ]
+
+train_overlay_subject_data <- subset(train_sec_means, subjID == overlay_subject)
+
+train_y_limits <- setNames(
+  vapply(group_channels, function(ch)
+    family_y_max_paired(train_group_means, "ci_hi",
+                        train_overlay_subject_data, ch, group_channels),
+    numeric(1)),
+  group_channels)
+
+recovery_data$probe <- with(recovery_data,
+                            ave(time_s, filename, FUN = function(t) rank(t)))
+
+recovery_rows <- list()
+
+for (ch in group_channels) {
+  ycol <- paste0(ch, "_norm")
+  d <- recovery_data[!is.na(recovery_data[[ycol]]), ]
+  keys <- list(freq = d$freq, probe = d$probe)
+
+  n_df    <- aggregate(d[ycol],       by = keys, FUN = length)
+  mean_df <- aggregate(d[ycol],       by = keys, FUN = mean)
+  sd_df   <- aggregate(d[ycol],       by = keys, FUN = sd)
+  time_df <- aggregate(d["time_min"], by = keys, FUN = mean)
+  names(n_df)[3] <- "n"; names(mean_df)[3] <- "mean"; names(sd_df)[3] <- "sd"
+
+  g <- Reduce(function(a, b) merge(a, b, by = c("freq", "probe")),
+              list(n_df, mean_df, sd_df, time_df))
+  g$channel <- ch
+  recovery_rows[[ch]] <- g
+}
+
+recovery_group_means <- do.call(rbind, recovery_rows)
+
+recovery_group_means$se    <- with(recovery_group_means, sd / sqrt(n))
+recovery_group_means$ci_lo <- with(recovery_group_means, mean - qt(0.975, n - 1) * se)
+recovery_group_means$ci_hi <- with(recovery_group_means, mean + qt(0.975, n - 1) * se)
+
+recovery_group_means <- recovery_group_means[order(recovery_group_means$channel,
+                                                   recovery_group_means$freq,
+                                                   recovery_group_means$probe), ]
+
+recovery_overlay_subject_data <- subset(recovery_data, subjID == overlay_subject)
+
+recovery_y_limits <- setNames(
+  vapply(group_channels, function(ch)
+    family_y_max_paired(recovery_group_means, "ci_hi",
+                        recovery_overlay_subject_data, ch, group_channels),
+    numeric(1)),
+  group_channels)
+```
+
+## End-of-train asymptotes and models
+
+```{r build-asymptotes}
+# Builds `train_asymptotes`: one row per recording x channel.
+asymptote_window_seconds <- 5
+
+max_sec_by_file <- tapply(train_sec_means$sec, train_sec_means$filename, max)
+
+asymptote_rows <- train_sec_means[
+  train_sec_means$sec >
+    max_sec_by_file[train_sec_means$filename] - asymptote_window_seconds, ]
+stopifnot(all(table(asymptote_rows$filename) == asymptote_window_seconds))
+
+train_asymptotes <- do.call(rbind, lapply(group_channels, function(ch) {
+  ycol <- paste0(ch, "_norm")
+  d <- asymptote_rows[!is.na(asymptote_rows[[ycol]]), ]
+  if (!nrow(d)) return(NULL)
+  asymptote_by_file <- aggregate(d[ycol], by = list(filename = d$filename), FUN = safe_mean)
+  names(asymptote_by_file)[2] <- "asymptote"
+  out <- merge(unique(d[c("filename", "subjID", "freq")]),
+               asymptote_by_file, by = "filename")
+  out$channel <- ch
+  out
+}))
+
+train_asymptotes <- train_asymptotes[order(train_asymptotes$channel,
+                                           train_asymptotes$freq,
+                                           train_asymptotes$subjID), ]
+
+stopifnot(all(is.finite(train_asymptotes$asymptote)), all(train_asymptotes$asymptote >= 0))
+```
+
+```{r asymptote-models}
+# Fits the end-of-train models and builds `asymptote_emmeans` and `asymptote_tests`.
+asymptote_freq_levels <- sort(unique(train_asymptotes$freq))
+
+asymptote_model_data <- train_asymptotes
+asymptote_model_data$freq <- as.numeric(asymptote_model_data$freq)
+
+admdata   <- subset(asymptote_model_data, channel == "ADMpk2pk")
+snapdata  <- subset(asymptote_model_data, channel == "filtSNAPpk2pk")
+elbowdata <- subset(asymptote_model_data, channel == "filtelbowpk2pk")
+
+mod0 <- lmer(asymptote ~ freq + (1|subjID), data = admdata)
+mod1 <- lmer(asymptote ~ freq + (1|subjID), data = snapdata)
+mod2 <- lmer(asymptote ~ freq + (1|subjID), data = elbowdata)
+
+
+asymptote_models <- list(ADMpk2pk       = mod0,
+                         filtSNAPpk2pk  = mod1,
+                         filtelbowpk2pk = mod2)
+
+# `at =` is required: `freq` is continuous.
+asymptote_emmeans <- do.call(rbind, lapply(names(asymptote_models), function(ch) {
+  s <- as.data.frame(summary(emmeans(asymptote_models[[ch]], ~ freq,
+                                     at = list(freq = asymptote_freq_levels))))
+  s$channel <- ch
+  s$freq    <- as.numeric(s$freq)
+  s
+}))
+
+asymptote_tests <- do.call(rbind, lapply(names(asymptote_models), function(ch) {
+  a  <- anova(asymptote_models[[ch]])
+  co <- summary(asymptote_models[[ch]])$coefficients
+  data.frame(channel = ch,
+             f      = a[["F value"]][1],
+             num_df = a[["NumDF"]][1],
+             den_df = a[["DenDF"]][1],
+             p      = a[["Pr(>F)"]][1],
+             t      = co["freq", "t value"],
+             t_df   = co["freq", "df"],
+             slope_per_hz     = co["freq", "Estimate"],
+             slope_per_10hz   = co["freq", "Estimate"] * 10,
+             stringsAsFactors = FALSE)
+}))
+
+# p formatted for a figure label.
+format_p_label <- function(p) {
+  if (!is.finite(p)) return("p = NA")
+  if (p < 0.001) return("p < 0.001")
+  paste0("p = ", sprintf(paste0("%.", max(0, 1 - floor(log10(p))), "f"), p))
+}
+
+```
+
+## Recovery-time models
+
+```{r build-recovery-threshold}
+# Builds `recovery_threshold_times` and the recovery-time models, means and tests.
+recovery_threshold_ratio       <- 0.9
+recovery_threshold_consecutive <- 2
+
+recovery_window_end_min <- max(recovery_data$time_min)
+
+# Time of the first of `consecutive` probes all above `threshold`, or NA if none.
+first_sustained_crossing <- function(value, time_min, threshold, consecutive) {
+  above <- !is.na(value) & value > threshold
+  n     <- length(above)
+  if (n < consecutive) return(NA_real_)
+  runs <- Reduce(`&`, lapply(seq_len(consecutive) - 1, function(k)
+    above[seq(1 + k, n - consecutive + 1 + k)]))
+  hit <- which(runs)
+  if (!length(hit)) return(NA_real_)
+  time_min[hit[1]]
+}
+
+recovery_threshold_rows <- list()
+
+for (ch in group_channels) {
+  ycol <- paste0(ch, "_norm")
+  for (f in sort(unique(recovery_data$filename))) {
+    d <- recovery_data[recovery_data$filename == f, ]
+    d <- d[order(d$time_min), ]
+    v <- d[[ycol]]
+    if (all(is.na(v))) next
+    t_cross <- first_sustained_crossing(v, d$time_min,
+                                        recovery_threshold_ratio,
+                                        recovery_threshold_consecutive)
+    recovery_threshold_rows[[paste(ch, f)]] <- data.frame(
+      channel  = ch,
+      subjID   = d$subjID[1],
+      freq     = d$freq[1],
+      filename = f,
+      t_cross  = t_cross,
+      censored = is.na(t_cross),
+      stringsAsFactors = FALSE)
+  }
+}
+
+recovery_threshold_times <- do.call(rbind, recovery_threshold_rows)
+
+# Censored recordings are plotted at the window end.
+recovery_threshold_times$y_plot <- ifelse(recovery_threshold_times$censored,
+                                          recovery_window_end_min,
+                                          recovery_threshold_times$t_cross)
+
+recovery_threshold_times$freq_index <-
+  match(recovery_threshold_times$freq, asymptote_freq_levels)
+
+recovery_threshold_model_data <- recovery_threshold_times
+recovery_threshold_model_data$freq <- as.numeric(recovery_threshold_model_data$freq)
+
+# Censored-lognormal model; response column 2 is 0 for exact, 2 for right-censored.
+recovery_threshold_models <- setNames(lapply(group_channels, function(ch) {
+  a <- subset(recovery_threshold_model_data, channel == ch)
+  a$resp <- cbind(log(a$y_plot), ifelse(a$censored, 2L, 0L))
+  mixed_model(resp ~ freq, random = ~ 1 | subjID, data = a,
+              family = censored.normal(), n_phis = 1)
+}), group_channels)
+
+
+# Marginal means back-transformed to minutes; `at =` is required.
+recovery_threshold_emmeans <- do.call(rbind, lapply(group_channels, function(ch) {
+  s <- as.data.frame(summary(emmeans(recovery_threshold_models[[ch]], ~ freq,
+                                     at = list(freq = asymptote_freq_levels))))
+  lo <- if ("asymp.LCL" %in% names(s)) s$asymp.LCL else s$lower.CL
+  hi <- if ("asymp.UCL" %in% names(s)) s$asymp.UCL else s$upper.CL
+  data.frame(channel = ch,
+             freq = as.numeric(s$freq),
+             emmean = exp(s$emmean), lower.CL = exp(lo), upper.CL = exp(hi),
+             stringsAsFactors = FALSE)
+}))
+
+recovery_threshold_lrt <- function(null_fit, full_fit, df) {
+  stat <- 2 * (as.numeric(logLik(full_fit)) - as.numeric(logLik(null_fit)))
+  c(chisq = stat, p = pchisq(stat, df, lower.tail = FALSE))
+}
+
+recovery_threshold_tests <- do.call(rbind, lapply(group_channels, function(ch) {
+  a <- subset(recovery_threshold_model_data, channel == ch)
+  a$resp <- cbind(log(a$y_plot), ifelse(a$censored, 2L, 0L))
+  m_null <- mixed_model(resp ~ 1, random = ~ 1 | subjID, data = a,
+                        family = censored.normal(), n_phis = 1)
+  df_freq <- 1L
+  t <- recovery_threshold_lrt(m_null, recovery_threshold_models[[ch]], df_freq)
+
+  slope_log_per_hz <- fixef(recovery_threshold_models[[ch]])[["freq"]]
+
+  data.frame(channel = ch, chisq = t[["chisq"]], df = df_freq, p = t[["p"]],
+             slope_log_per_hz = slope_log_per_hz,
+             time_ratio_per_25hz = exp(25 * slope_log_per_hz),
+             stringsAsFactors = FALSE)
+}))
+
+recovery_threshold_y_max <- recovery_window_end_min * 1.22
+```
+
+# RAW WAVEFORM TRACES
+
+Raw ADM, filtered SNAP and filtered elbow traces at the start and end of two trains.
+
+```{r raw-traces, fig.width = 8, fig.height = 4.8}
+# Builds the raw trace figures.
+raw_trace_files <- c(
+  "50 Hz, first 5 pulses" = "../outputs/data/ac_trace_50Hz_train_start.txt",
+  "50 Hz, last 5 pulses"  = "../outputs/data/ac_trace_50Hz_train_end.txt",
+  "10 Hz, first 5 pulses" = "../outputs/data/ac_trace_10Hz_train_start.txt",
+  "10 Hz, last 5 pulses"  = "../outputs/data/ac_trace_10Hz_train_end.txt"
+)
+
+# Reads a Spike2 text export into waveform samples and event times.
+read_spike2_text <- function(path) {
+
+  lines <- readLines(path, warn = FALSE)
+  starts <- grep('^"CHANNEL"', lines)
+  ends <- c(starts[-1] - 1, length(lines))
+
+  waveforms <- list()
+  events    <- list()
+
+  for (b in seq_along(starts)) {
+
+    block <- lines[starts[b]:ends[b]]
+    unquote  <- function(x) gsub('^"|"$', "", trimws(x))
+    ch_type  <- unquote(block[2])
+    ch_title <- unquote(block[4])
+    numeric_line <- suppressWarnings(!is.na(as.numeric(trimws(block))))
+
+    if (ch_type == "Waveform") {
+      start_line <- grep('^"START"', block)
+      start_fields <- strsplit(block[start_line], "\t")[[1]]
+      t0 <- as.numeric(start_fields[2])
+      dt <- as.numeric(start_fields[3])
+      keep <- numeric_line & seq_along(block) > start_line
+      mv   <- as.numeric(trimws(block[keep]))
+      waveforms[[ch_title]] <- data.frame(
+        channel = ch_title,
+        time_s  = t0 + (seq_along(mv) - 1) * dt,
+        mv      = mv,
+        stringsAsFactors = FALSE)
+    } else if (ch_type == "Evt+") {
+      keep <- numeric_line & seq_along(block) > 4
+      events[[ch_title]] <- as.numeric(trimws(block[keep]))
+    }
+  }
+
+  list(waveforms = do.call(rbind, waveforms), events = events)
+}
+
+raw_trace_plot <- function(trace, window_label, current_ma, freq_hz,
+                           facet_pulses = FALSE) {
+
+  w <- trace$waveforms
+  stim_times <- trace$events[["trigger"]]
+  t_zero <- min(stim_times)
+
+  span_s <- diff(range(w$time_s))
+  use_ms  <- span_s < 1
+  x_scale <- if (use_ms) 1000 else 1
+  x_lab   <- if (use_ms) "Time from first stimulus (ms)" else
+                         "Time from first stimulus (s)"
+
+  w$x        <- (w$time_s - t_zero) * x_scale
+  stim_x     <- (stim_times - t_zero) * x_scale
+  x_range <- c(0, max(w$x))
+
+  channel_order <- intersect(raw_trace_channels, unique(w$channel))
+  w <- w[w$channel %in% channel_order, ]
+
+  # Re-cuts the trace into one sweep per stimulus.
+  if (facet_pulses) {
+    facet_s <- raw_trace_facet_ms / 1000
+    w <- do.call(rbind, lapply(seq_along(stim_times), function(i) {
+      seg <- w[w$time_s >= stim_times[i] & w$time_s <= stim_times[i] + facet_s, ]
+      if (!nrow(seg)) return(NULL)
+      seg$x     <- (seg$time_s - stim_times[i]) * 1000
+      seg$pulse <- factor(sprintf("pulse %d", i),
+                          levels = sprintf("pulse %d", seq_along(stim_times)))
+      seg
+    }))
+    x_range <- c(0, raw_trace_facet_ms)
+    x_lab   <- "Time from each stimulus (ms)"
+  }
+  w$channel <- factor(w$channel, levels = channel_order)
+
+  panels <- lapply(seq_along(channel_order), function(i) {
+
+    ch      <- channel_order[i]
+    is_last <- i == length(channel_order)
+    d       <- w[w$channel == ch, ]
+    cap     <- raw_trace_ylim_mv[[ch]]
+
+    p <- ggplot(d, aes(x = x, y = mv)) +
+      geom_vline(xintercept = if (facet_pulses) 0 else stim_x, linetype = "dotted",
+                 linewidth = line_reference, colour = "grey55") +
+      baseline_hline(0) +
+      geom_line(linewidth = line_trace, colour = "grey15") +
+      coord_cartesian(xlim = x_range, ylim = c(-cap, cap), expand = FALSE) +
+      scale_y_continuous(breaks = pretty(c(-cap, cap), n = 4)) +
+      labs(x = if (is_last) x_lab else NULL,
+           y = raw_trace_channel_labels[[ch]]) +
+      manuscript_theme() +
+      theme(axis.title.y = element_text(size = 9))
+
+    if (facet_pulses) {
+      p <- p + facet_wrap(~ pulse, nrow = 1) +
+        theme(panel.spacing.x = unit(3, "pt"),
+              strip.background = element_blank(),
+              strip.text = if (i == 1) element_text(size = 8) else element_blank())
+    }
+
+    if (!is_last) {
+      p <- p + theme(axis.text.x  = element_blank(),
+                     axis.ticks.x = element_blank(),
+                     axis.line.x  = element_blank())
+    }
+    p
+  })
+
+  panel_heights <- c(rep(1, length(panels) - 1), 1.3)
+
+  stack <- cowplot::plot_grid(plotlist = panels, ncol = 1,
+                              align = "v", axis = "lr",
+                              rel_heights = panel_heights)
+
+  header_text <- sprintf("Individual Participant - %g Hz - %s", freq_hz, window_label)
+
+  # Sampling rate from one channel's own consecutive samples.
+  sampling_khz <- local({
+    t1 <- sort(w$time_s[w$channel == channel_order[1]])
+    round(1 / diff(t1[1:2]) / 1000, 1)
+  })
+
+  sub_text <- sprintf(
+    paste("%d channels at %g kHz, amplitude in mV, %d stimuli at %g mA | %s"),
+    length(channel_order), sampling_khz,
+    length(stim_times), current_ma,
+    if (facet_pulses)
+      sprintf(paste("one panel per stimulus, first %g ms of each;",
+                    "the %g ms between pulses is not drawn"),
+              raw_trace_facet_ms,
+              round(1000 / freq_hz - raw_trace_facet_ms))
+    else "dotted lines = stimulus instants")
+
+  cap_text <- paste(sprintf("%s +/-%g", channel_order,
+                            unlist(raw_trace_ylim_mv[channel_order])),
+                    collapse = ", ")
+  cap_full <- paste(strwrap(paste0(
+    "Spike2 text export, un-normalised and NOT noise-subtracted. ",
+    "Y limits are FIXED per channel (", cap_text, " mV) and traces are clipped at them, ",
+    "so a deflection reaching the panel edge is larger than shown - the stimulus ",
+    "artefact in the first ~2 ms of each sweep is the main one. ",
+    "Panel heights are NOT comparable between channels. ",
+    "The unfiltered SNAP and elbow channels are recorded but not drawn."), width = 118),
+    collapse = "\n")
+
+  header <- cowplot::ggdraw() +
+    cowplot::draw_label(header_text, x = 0.01, y = 0.72, hjust = 0,
+                        size = 12, fontface = "plain") +
+    cowplot::draw_label(sub_text, x = 0.01, y = 0.28, hjust = 0,
+                        size = 8.5, colour = "grey25")
+  footer <- cowplot::ggdraw() +
+    cowplot::draw_label(cap_full, x = 0.01, y = 0.5, hjust = 0,
+                        size = 7.5, colour = "grey35")
+
+  footer_rel <- 0.06 * length(strsplit(cap_full, "\n")[[1]])
+
+  cowplot::plot_grid(header, stack, footer, ncol = 1,
+                     rel_heights = c(0.13, 1, footer_rel))
+}
+
+# Recording name from line 2 of each export.
+raw_trace_source <- vapply(raw_trace_files, function(p) {
+  info <- gsub('^"|"$', "", trimws(readLines(p, n = 2, warn = FALSE)[2]))
+  sub("\\.smrx$", "", info)
+}, character(1))
+stopifnot(all(raw_trace_source %in% pulse_data$filename))
+
+# Frequency and modal train current per export.
+raw_trace_meta <- lapply(raw_trace_source, function(src) {
+  p <- subset(pulse_data, filename == src & measure == "Train")
+  list(freq       = p$freq[1],
+       current_ma = as.numeric(names(sort(table(p$currAmp), decreasing = TRUE))[1]))
+})
+names(raw_trace_meta) <- names(raw_trace_files)
+
+raw_trace_channels <- c("ADM", "filt_SNAP", "filt_Elbow")
+
+raw_trace_facet_ms     <- 40
+raw_trace_facet_span_s <- 0.25
+
+raw_trace_ylim_mv <- list(ADM        = 1,
+                          filt_SNAP  = 0.03,
+                          filt_Elbow = 0.03)
+
+raw_trace_channel_labels <- c(
+  ADM        = "ADM CMAP\n(motor)",
+  filt_SNAP  = "filtered SNAP\n(sensory)",
+  filt_Elbow = "filtered elbow\n(mixed)")
+
+raw_traces <- lapply(raw_trace_files, read_spike2_text)
+
+raw_trace_span_s <- vapply(raw_traces,
+                           function(tr) diff(range(tr$waveforms$time_s)), numeric(1))
+raw_trace_faceted <- raw_trace_span_s > raw_trace_facet_span_s
+
+raw_trace_plots <- setNames(lapply(names(raw_traces), function(nm)
+  raw_trace_plot(raw_traces[[nm]],
+                 sub("^[^,]*, ", "", nm),
+                 raw_trace_meta[[nm]]$current_ma,
+                 raw_trace_meta[[nm]]$freq,
+                 facet_pulses = raw_trace_faceted[[nm]])),
+  names(raw_traces))
+
+for (nm in names(raw_traces)) {
+  print(raw_trace_plots[[nm]])
+  save_figure(raw_trace_plots[[nm]],
+              sub("^ac_trace", "ac_raw_trace",
+                  sub("\\.txt$", "", basename(raw_trace_files[[nm]]))))
+}
+```
+
+# INDIVIDUAL PARTICIPANT
+
+One participant's response during the train and during recovery at each frequency.
+
+```{r train-subject-overlay, fig.width = 7, fig.height = 4.5}
+# Builds the three single-subject train figures.
+train_subject <- overlay_subject
+stopifnot(train_subject %in% train_sec_means$subjID)
+
+train_subject_data <- subset(train_sec_means, subjID == train_subject)
+
+train_subject_overlay_plot <- function(ch, df = train_subject_data) {
+
+  ycol <- paste0(ch, "_norm")
+  d <- df[!is.na(df[[ycol]]), ]
+  if (!nrow(d)) return(NULL)
+  d$norm_value <- d[[ycol]]
+
+  ggplot(d, aes(x = time, y = norm_value, colour = factor(freq))) +
+    baseline_hline() +
+    geom_line(linewidth = line_data) +
+    scale_colour_manual(values = freq_cols, name = "Frequency (Hz)") +
+    scale_x_continuous(breaks = seq(0, 240, by = 60), limits = NULL,
+                       expand = expansion(mult = c(0, 0.05))) +
+    expand_limits(x = 0) +
+    coord_cartesian(ylim = c(0, train_y_limits[[ch]])) +
+    scale_y_continuous(breaks = baseline_breaks(train_y_limits[[ch]]),
+                       expand = expansion(mult = c(0, 0.05))) +
+    labs(x = "Time (s)", y = ylab_norm(ch),
+         title = paste0("Individual Participant: ", channel_short[[ch]],
+                        " Response During the Train"),
+         caption = "one recording per frequency, per-second means") +
+    manuscript_theme()
+}
+
+train_subject_overlay_plots <- Filter(Negate(is.null),
+  setNames(lapply(group_channels, train_subject_overlay_plot), group_channels))
+
+for (ch in names(train_subject_overlay_plots)) {
+  print(train_subject_overlay_plots[[ch]])
+  save_figure(train_subject_overlay_plots[[ch]],
+              paste0("ac_individual_train_", figure_channel_names[[ch]]))
+}
+```
+
+```{r recovery-subject-overlay, fig.width = 7, fig.height = 4.5}
+# Builds the three single-subject recovery figures.
+recovery_subject <- overlay_subject
+stopifnot(recovery_subject %in% recovery_data$subjID)
+
+recovery_subject_data <- subset(recovery_data, subjID == recovery_subject)
+
+recovery_subject_overlay_plot <- function(ch, df = recovery_subject_data) {
+
+  ycol <- paste0(ch, "_norm")
+  d <- df[!is.na(df[[ycol]]), ]
+  if (!nrow(d)) return(NULL)
+  d$norm_value <- d[[ycol]]
+
+  ggplot(d, aes(x = time_min, y = norm_value, colour = factor(freq))) +
+    baseline_hline() +
+    geom_line(linewidth = line_data) +
+    geom_point(size = 0.7) +
+    scale_colour_manual(values = freq_cols, name = "Frequency (Hz)") +
+    scale_x_continuous(breaks = seq(0, 15, by = 3),
+                       expand = expansion(mult = c(0, 0.05))) +
+    expand_limits(x = c(0, 15)) +
+    coord_cartesian(ylim = c(0, recovery_y_limits[[ch]])) +
+    scale_y_continuous(breaks = baseline_breaks(recovery_y_limits[[ch]]),
+                       expand = expansion(mult = c(0, 0.05))) +
+    labs(x = "Time since end of train (min)", y = ylab_norm(ch),
+         title = paste0("Individual Participant: ", channel_short[[ch]],
+                        " Response During Recovery"),
+         caption = "one recording per frequency, one point per probe") +
+    manuscript_theme()
+}
+
+recovery_subject_overlay_plots <- Filter(Negate(is.null),
+  setNames(lapply(group_channels, recovery_subject_overlay_plot), group_channels))
+
+for (ch in names(recovery_subject_overlay_plots)) {
+  print(recovery_subject_overlay_plots[[ch]])
+  save_figure(recovery_subject_overlay_plots[[ch]],
+              paste0("ac_individual_recovery_", figure_channel_names[[ch]]))
+}
+```
+
+# GROUP MEANS DURING THE TRAIN
+
+Mean normalised response across subjects during the train, with 95% confidence intervals.
+
+```{r train-group-means, fig.width = 7, fig.height = 4.5}
+# Builds the three train group-mean figures.
+train_group_plot <- function(ch) {
+
+  g <- train_group_means[train_group_means$channel == ch, ]
+
+  n_range <- tapply(g$n, g$freq, function(x)
+    if (min(x) == max(x)) as.character(max(x)) else paste0(min(x), "-", max(x)))
+  subtitle_text <- paste0("mean across subjects, 95% CI | n = ",
+                          paste0(names(n_range), " Hz: ", n_range, collapse = "; "))
+
+  ggplot(g, aes(x = time, y = mean,
+                colour = factor(freq), fill = factor(freq))) +
+    baseline_hline() +
+    geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), colour = NA, alpha = 0.18) +
+    geom_line(linewidth = line_data) +
+    scale_colour_manual(values = freq_cols, name = "Frequency (Hz)") +
+    scale_fill_manual(values = freq_cols, guide = "none") +
+    scale_x_continuous(breaks = seq(0, 240, by = 60), limits = NULL,
+                       expand = expansion(mult = c(0, 0.05))) +
+    expand_limits(x = 0) +
+    coord_cartesian(ylim = c(0, train_y_limits[[ch]])) +
+    scale_y_continuous(breaks = baseline_breaks(train_y_limits[[ch]]),
+                       expand = expansion(mult = c(0, 0.05))) +
+    labs(x = "Time (s)", y = ylab_norm(ch),
+         title = paste0(channel_short[[ch]], " Response During the Train"),
+         caption = subtitle_text) +
+    manuscript_theme()
+}
+
+for (ch in group_channels) {
+  p <- train_group_plot(ch)
+  print(p)
+  save_figure(p, paste0("ac_group_mean_train_", figure_channel_names[[ch]]))
+}
+```
+
+# GROUP MEANS DURING RECOVERY
+
+Mean normalised response across subjects to the single probes during the 15 minutes after the train.
+
+```{r recovery-group-means, fig.width = 7, fig.height = 4.5}
+# Builds the three recovery group-mean figures.
+recovery_group_plot <- function(ch) {
+
+  g <- recovery_group_means[recovery_group_means$channel == ch, ]
+
+  n_range <- tapply(g$n, g$freq, function(x)
+    if (min(x) == max(x)) as.character(max(x)) else paste0(min(x), "-", max(x)))
+  subtitle_text <- paste0("mean across subjects, 95% CI | n = ",
+                          paste0(names(n_range), " Hz: ", n_range, collapse = "; "))
+
+  ggplot(g, aes(x = time_min, y = mean,
+                colour = factor(freq), fill = factor(freq))) +
+    baseline_hline() +
+    geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), colour = NA, alpha = 0.18) +
+    geom_line(linewidth = line_data) +
+    scale_colour_manual(values = freq_cols, name = "Frequency (Hz)") +
+    scale_fill_manual(values = freq_cols, guide = "none") +
+    scale_x_continuous(breaks = seq(0, 15, by = 3),
+                       expand = expansion(mult = c(0, 0.05))) +
+    expand_limits(x = c(0, 15)) +
+    coord_cartesian(ylim = c(0, recovery_y_limits[[ch]])) +
+    scale_y_continuous(
+      breaks = baseline_breaks(recovery_y_limits[[ch]]),
+      expand = expansion(mult = c(0, 0.05))) +
+    labs(x = "Time since end of train (min)", y = ylab_norm(ch),
+         title = paste0(channel_short[[ch]], " Response During Recovery"),
+         caption = subtitle_text) +
+    manuscript_theme()
+}
+
+for (ch in group_channels) {
+  p <- recovery_group_plot(ch)
+  print(p)
+  save_figure(p, paste0("ac_group_mean_recovery_", figure_channel_names[[ch]]))
+}
+```
+
+# END-OF-TRAIN ASYMPTOTE AGAINST FREQUENCY
+
+Mean normalised response over the last 5 seconds of each train, against stimulation frequency.
+
+```{r asymptote-scatter, fig.width = 8, fig.height = 6.5}
+# Builds the three end-of-train scatter figures.
+asymptote_subjects <- sort(unique(train_asymptotes$subjID))
+subject_cols <- setNames(hcl.colors(length(asymptote_subjects), "Dark 3"),
+                         asymptote_subjects)
+
+asymptote_freq_span    <- diff(range(asymptote_freq_levels))
+asymptote_freq_min_gap <- min(diff(asymptote_freq_levels))
+
+asymptote_dodge_width    <- 0.025 * asymptote_freq_span
+asymptote_crossbar_width <- 0.45 * asymptote_freq_min_gap
+asymptote_ci_cap_width   <- 0.4 * asymptote_crossbar_width
+asymptote_freq_pad       <- 0.06 * asymptote_freq_span
+
+asymptote_freq_limits <- range(asymptote_freq_levels) +
+                         c(-1, 1) * asymptote_freq_pad
+
+asymptote_q1 <- function(x) quantile(x, 0.25, names = FALSE)
+asymptote_q3 <- function(x) quantile(x, 0.75, names = FALSE)
+
+asymptote_data_top <- max(c(train_asymptotes$asymptote, asymptote_emmeans$upper.CL))
+
+asymptote_y_inc    <- 0.25
+asymptote_y_max    <- ceiling(asymptote_data_top * 1.05 / asymptote_y_inc) * asymptote_y_inc
+asymptote_y_breaks <- seq(0, asymptote_y_max, by = asymptote_y_inc)
+
+asymptote_scatter_plot <- function(ch) {
+
+  d <- train_asymptotes[train_asymptotes$channel == ch, ]
+  d$freq_index <- match(d$freq, asymptote_freq_levels)
+
+  subject_offsets <- setNames(
+    seq(-asymptote_dodge_width / 2, asymptote_dodge_width / 2,
+        length.out = length(asymptote_subjects)),
+    asymptote_subjects)
+  d$x_pos <- d$freq + subject_offsets[d$subjID]
+
+  # Splits a subject's line where a frequency is missing.
+  d <- d[order(d$subjID, d$freq_index), ]
+  d$segment <- ave(d$freq_index, d$subjID,
+                   FUN = function(i) cumsum(c(1, diff(i) > 1)))
+
+  n_by_freq <- table(factor(d$freq, levels = asymptote_freq_levels))
+  subtitle_text <- paste0(
+    "mean of the last ", asymptote_window_seconds,
+    " s, proportion of pre-train singles | n = ",
+    paste0(names(n_by_freq), " Hz: ", as.integer(n_by_freq), collapse = "; "))
+
+  em  <- asymptote_emmeans[asymptote_emmeans$channel == ch, ]
+  tst <- asymptote_tests[asymptote_tests$channel == ch, ]
+  test_label <- paste0("effect of frequency:\nt(",
+                       sprintf("%.1f", tst$t_df), ") = ",
+                       sprintf("%.2f", tst$t), ", ", format_p_label(tst$p),
+                       "\nslope = ", sprintf("%+.4f", tst$slope_per_hz), " per Hz")
+
+  ggplot(d, aes(x = x_pos, y = asymptote, colour = subjID)) +
+    baseline_hline() +
+    geom_errorbar(data = em, inherit.aes = FALSE,
+                  aes(x = freq, ymin = lower.CL, ymax = upper.CL),
+                  width = asymptote_ci_cap_width, linewidth = line_summary,
+                  colour = "grey30") +
+    geom_crossbar(data = em, inherit.aes = FALSE,
+                  aes(x = freq, y = emmean,
+                      ymin = emmean, ymax = emmean),
+                  width = asymptote_crossbar_width, linewidth = line_summary,
+                  colour = "grey30") +
+    geom_line(aes(group = interaction(subjID, segment)),
+              linewidth = line_summary, alpha = 0.7, linetype = "dashed") +
+    geom_point(size = 1.6, alpha = 0.9) +
+    annotate("text", x = Inf, y = Inf, label = test_label,
+             hjust = 1.05, vjust = 1.2, size = 2.6, colour = "grey20",
+             lineheight = 0.95) +
+    scale_colour_manual(values = subject_cols, guide = "none") +
+    scale_x_continuous(breaks = asymptote_freq_levels,
+                       limits = asymptote_freq_limits) +
+    coord_cartesian(ylim = c(0, asymptote_y_max)) +
+    scale_y_continuous(breaks = asymptote_y_breaks,
+                       expand = expansion(mult = c(0, 0.05))) +
+    labs(x = "Stimulation frequency (Hz)",
+         y = paste0(title_case_label(channel_labels[[ch]]),
+                    " at End of Train\nNormalised Peak-to-Peak Response"),
+         title = paste0(channel_short[[ch]], " Response at End of Train"),
+         caption = paste0(
+           subtitle_text,
+           "\nGrey: fitted mean (horizontal bar) and its 95% CI (vertical line) from",
+           "\nlmer(asymptote ~ freq + (1|subjID)), frequency continuous in Hz, evaluated at",
+           " the four\nfrequencies tested - four points on one line, not four separate means.",
+           "\nTop right: t test of the linear effect of frequency in that model",
+           " (Satterthwaite df), and its slope.\nThe straight-line assumption behind that",
+           " slope is not tested by this document.")) +
+    manuscript_theme()
+}
+
+for (ch in group_channels) {
+  p <- asymptote_scatter_plot(ch)
+  print(p)
+  save_figure(p, paste0("ac_end_of_train_scatter_", figure_channel_names[[ch]]))
+}
+```
+
+# TIME TO SUSTAINED RECOVERY
+
+Time for each recording to reach two consecutive probes above 90% of baseline, against frequency.
+
+```{r recovery-threshold-scatter, fig.width = 8, fig.height = 4.8}
+# Builds the three recovery-time scatter figures.
+recovery_threshold_plot <- function(ch) {
+
+  d  <- recovery_threshold_times[recovery_threshold_times$channel == ch, ]
+  em <- recovery_threshold_emmeans[recovery_threshold_emmeans$channel == ch, ]
+
+  tst <- recovery_threshold_tests[recovery_threshold_tests$channel == ch, ]
+  test_label <- paste0("effect of frequency:\nchi-square(", tst$df, ") = ",
+                       sprintf("%.2f", tst$chisq), ", ", format_p_label(tst$p),
+                       "\ntime ratio = ", sprintf("%.2f", tst$time_ratio_per_25hz),
+                       " per 25 Hz")
+
+  subject_offsets <- setNames(
+    seq(-asymptote_dodge_width / 2, asymptote_dodge_width / 2,
+        length.out = length(asymptote_subjects)),
+    asymptote_subjects)
+  d$x_pos <- d$freq + subject_offsets[d$subjID]
+
+  # Splits a subject's line where a frequency is missing.
+  d <- d[order(d$subjID, d$freq_index), ]
+  d$segment <- ave(d$freq_index, d$subjID,
+                   FUN = function(i) cumsum(c(1, diff(i) > 1)))
+
+  n_by_freq <- table(factor(d$freq, levels = asymptote_freq_levels))
+  cens_by_freq <- tapply(d$censored, factor(d$freq, levels = asymptote_freq_levels), sum)
+  cens_by_freq[is.na(cens_by_freq)] <- 0
+
+  subtitle_text <- paste0(
+    "first of ", recovery_threshold_consecutive, " consecutive probes above ",
+    recovery_threshold_ratio, " x pre-train singles | n = ",
+    paste0(names(n_by_freq), " Hz: ", as.integer(n_by_freq), collapse = "; "),
+    "\ngrey: fitted mean (horizontal bar) and 95% CI (vertical line), from a",
+    " censored-lognormal AFT",
+    "\n(GLMMadaptive, log-time, random intercept per subject, frequency continuous in Hz) -",
+    "\nfour points on one fitted line in log-time, and an interval on the ESTIMATE, not the",
+    " spread of the recordings",
+    if (any(cens_by_freq > 0))
+      paste0("\ntriangles = had not recovered by ",
+             sprintf("%.1f", recovery_window_end_min), " min (",
+             paste0(names(cens_by_freq)[cens_by_freq > 0], " Hz: ",
+                    as.integer(cens_by_freq[cens_by_freq > 0]), collapse = "; "),
+             ") - plotted at the window end, not measured there")
+    else "",
+    "\ntop right: likelihood-ratio test of the linear effect of frequency against a null",
+    " carrying the same\nrandom intercept (1 df), with the slope as a time ratio")
+
+  ggplot(d, aes(x = x_pos, y = y_plot, colour = subjID)) +
+    geom_hline(yintercept = recovery_window_end_min, linetype = "dotted",
+               linewidth = line_reference, colour = "grey60") +
+    geom_errorbar(data = em, inherit.aes = FALSE,
+                  aes(x = freq, ymin = lower.CL, ymax = upper.CL),
+                  width = asymptote_ci_cap_width, linewidth = line_summary,
+                  colour = "grey30") +
+    geom_crossbar(data = em, inherit.aes = FALSE,
+                  aes(x = freq, y = emmean, ymin = emmean, ymax = emmean),
+                  width = asymptote_crossbar_width, linewidth = line_summary,
+                  colour = "grey30") +
+    geom_line(aes(group = interaction(subjID, segment)),
+              linewidth = line_summary, alpha = 0.7, linetype = "dashed") +
+    geom_point(data = subset(d, !censored), size = 1.6, alpha = 0.9) +
+    geom_point(data = subset(d, censored), shape = 2, size = 2.2,
+               stroke = 0.7, show.legend = FALSE) +
+    annotate("text", x = Inf, y = Inf, label = test_label,
+             hjust = 1.05, vjust = 1.2, size = 2.6, colour = "grey20",
+             lineheight = 0.95) +
+    scale_colour_manual(values = subject_cols, guide = "none") +
+    scale_x_continuous(breaks = asymptote_freq_levels,
+                       limits = asymptote_freq_limits) +
+    expand_limits(y = c(0, recovery_threshold_y_max)) +
+    scale_y_continuous(breaks = seq(0, 15, by = 3),
+                       expand = expansion(mult = c(0, 0.05))) +
+    labs(x = "Stimulation frequency (Hz)",
+         y = "Recovery time (mins)",
+         title = paste0(channel_short[[ch]], " Response: Time to Sustained Recovery"),
+         caption = subtitle_text) +
+    manuscript_theme() +
+    theme(plot.caption = element_text(size = 7, colour = "grey35", hjust = 0))
+}
+
+recovery_threshold_plots <- setNames(lapply(group_channels, recovery_threshold_plot),
+                                     group_channels)
+
+for (ch in names(recovery_threshold_plots)) {
+  print(recovery_threshold_plots[[ch]])
+  save_figure(recovery_threshold_plots[[ch]],
+              paste0("ac_recovery_time_scatter_", figure_channel_names[[ch]]))
+}
+```
+
+# ADDITIONAL FIGURES AND MODEL OUTPUT
+
+## End-of-train models
+
+```{r asymptote-model-output}
+# Prints the end-of-train model summaries, marginal means and tests.
+summary(mod0)
+summary(mod1)
+summary(mod2)
+
+cat("\nestimated marginal means (as drawn on the scatter figures):\n")
+print(asymptote_emmeans[c("channel", "freq", "emmean", "SE", "lower.CL", "upper.CL")],
+      row.names = FALSE, digits = 3)
+
+cat("\neffect of frequency (annotated on the scatter figures):\n")
+print(data.frame(channel        = asymptote_tests$channel,
+                 t              = round(asymptote_tests$t, 2),
+                 df             = round(asymptote_tests$t_df, 1),
+                 p              = signif(asymptote_tests$p, 3),
+                 slope_per_hz   = signif(asymptote_tests$slope_per_hz, 3),
+                 slope_per_10hz = signif(asymptote_tests$slope_per_10hz, 3),
+                 f              = signif(asymptote_tests$f, 3)),
+      row.names = FALSE)
+```
+
+### Residual diagnostics for the end-of-train models
+
+```{r asymptote-diagnostics}
+# Builds the residual diagnostic plots and outlier tests for the end-of-train models.
+asymptote_diagnostics <- function(model, label) {
+  cat("\n---", label, "---\n")
+  qqp(resid(model))
+  plot(residuals(model) ~ predict(model, re.form = NA),
+       xlab = "fitted (fixed effects only)", ylab = "residual", main = label)
+  simres <- simulateResiduals(model)
+  plot(simres)
+  print(testOutliers(simres))
+}
+
+# WARNING: may throw figure margin error depending on your display. Comment out or use knit function.
+
+asymptote_diagnostics(mod0, "motor (ADMpk2pk)")
+asymptote_diagnostics(mod1, "sensory (filtSNAPpk2pk)")
+asymptote_diagnostics(mod2, "mixed (filtelbowpk2pk)")
+```
+
+## Recovery-time model output
+
+Recovery-time model summaries, and recovery times by channel and frequency.
+
+```{r recovery-threshold-models}
+# Prints the recovery-time model summaries and recovery-time table.
+for (ch in group_channels) print(summary(recovery_threshold_models[[ch]]))
+
+cat(sprintf("\ntime to %d consecutive probes above %.2f (min), by channel x frequency:\n",
+            recovery_threshold_consecutive, recovery_threshold_ratio))
+for (ch in group_channels) {
+  a <- recovery_threshold_times[recovery_threshold_times$channel == ch, ]
+  cat(" ", ch, "\n")
+  print(do.call(rbind, lapply(split(a, a$freq), function(x) data.frame(
+    freq       = x$freq[1],
+    n          = nrow(x),
+    reached    = sum(!x$censored),
+    censored   = sum(x$censored),
+    median_min = round(median(x$y_plot), 2),
+    q1_min     = round(asymptote_q1(x$y_plot), 2),
+    q3_min     = round(asymptote_q3(x$y_plot), 2)))),
+    row.names = FALSE)
+}
+```
