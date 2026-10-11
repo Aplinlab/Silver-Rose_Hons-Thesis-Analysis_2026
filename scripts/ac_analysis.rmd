@@ -429,8 +429,8 @@ asymptote_emmeans <- do.call(rbind, lapply(names(asymptote_models), function(ch)
 }))
 
 asymptote_tests <- do.call(rbind, lapply(names(asymptote_models), function(ch) {
-  a  <- anova(asymptote_models[[ch]])
-  co <- summary(asymptote_models[[ch]])$coefficients
+  a  <- anova(asymptote_models[[ch]], ddf = "Kenward-Roger")
+  co <- summary(asymptote_models[[ch]], ddf = "Kenward-Roger")$coefficients
   data.frame(channel = ch,
              f      = a[["F value"]][1],
              num_df = a[["NumDF"]][1],
@@ -438,7 +438,6 @@ asymptote_tests <- do.call(rbind, lapply(names(asymptote_models), function(ch) {
              p      = a[["Pr(>F)"]][1],
              t      = co["freq", "t value"],
              t_df   = co["freq", "df"],
-             slope_per_hz     = co["freq", "Estimate"],
              slope_per_10hz   = co["freq", "Estimate"] * 10,
              stringsAsFactors = FALSE)
 }))
@@ -547,7 +546,7 @@ recovery_threshold_tests <- do.call(rbind, lapply(group_channels, function(ch) {
 
   data.frame(channel = ch, chisq = t[["chisq"]], df = df_freq, p = t[["p"]],
              slope_log_per_hz = slope_log_per_hz,
-             time_ratio_per_25hz = exp(25 * slope_log_per_hz),
+             percent_change_per_10hz = 100 * (exp(10 * slope_log_per_hz) - 1),
              stringsAsFactors = FALSE)
 }))
 
@@ -1006,7 +1005,7 @@ asymptote_scatter_plot <- function(ch) {
   test_label <- paste0("effect of frequency:\nt(",
                        sprintf("%.1f", tst$t_df), ") = ",
                        sprintf("%.2f", tst$t), ", ", format_p_label(tst$p),
-                       "\nslope = ", sprintf("%+.4f", tst$slope_per_hz), " per Hz")
+                       "\nslope = ", sprintf("%+.3f", tst$slope_per_10hz), " per 10 Hz")
 
   ggplot(d, aes(x = x_pos, y = asymptote, colour = subjID)) +
     baseline_hline() +
@@ -1041,7 +1040,7 @@ asymptote_scatter_plot <- function(ch) {
            "\nlmer(asymptote ~ freq + (1|subjID)), frequency continuous in Hz, evaluated at",
            " the four\nfrequencies tested - four points on one line, not four separate means.",
            "\nTop right: t test of the linear effect of frequency in that model",
-           " (Satterthwaite df), and its slope.\nThe straight-line assumption behind that",
+           " (Kenward-Roger df), and its slope per 10 Hz.\nThe straight-line assumption behind that",
            " slope is not tested by this document.")) +
     manuscript_theme()
 }
@@ -1065,10 +1064,10 @@ recovery_threshold_plot <- function(ch) {
   em <- recovery_threshold_emmeans[recovery_threshold_emmeans$channel == ch, ]
 
   tst <- recovery_threshold_tests[recovery_threshold_tests$channel == ch, ]
-  test_label <- paste0("effect of frequency:\nchi-square(", tst$df, ") = ",
+  test_label <- paste0("effect of frequency:\n\u03c7\u00b2(", tst$df, ") = ",
                        sprintf("%.2f", tst$chisq), ", ", format_p_label(tst$p),
-                       "\ntime ratio = ", sprintf("%.2f", tst$time_ratio_per_25hz),
-                       " per 25 Hz")
+                       "\nrecovery time ", sprintf("%+.1f%%", tst$percent_change_per_10hz),
+                       " per 10 Hz")
 
   subject_offsets <- setNames(
     seq(-asymptote_dodge_width / 2, asymptote_dodge_width / 2,
@@ -1102,7 +1101,7 @@ recovery_threshold_plot <- function(ch) {
              ") - plotted at the window end, not measured there")
     else "",
     "\ntop right: likelihood-ratio test of the linear effect of frequency against a null",
-    " carrying the same\nrandom intercept (1 df), with the slope as a time ratio")
+    " carrying the same\nrandom intercept (1 df), with the slope as the % change in median recovery time per 10 Hz")
 
   ggplot(d, aes(x = x_pos, y = y_plot, colour = subjID)) +
     geom_hline(yintercept = recovery_window_end_min, linetype = "dotted",
@@ -1153,9 +1152,9 @@ for (ch in names(recovery_threshold_plots)) {
 
 ```{r asymptote-model-output}
 # Prints the end-of-train model summaries, marginal means and tests.
-summary(mod0)
-summary(mod1)
-summary(mod2)
+summary(mod0, ddf = "Kenward-Roger")
+summary(mod1, ddf = "Kenward-Roger")
+summary(mod2, ddf = "Kenward-Roger")
 
 cat("\nestimated marginal means (as drawn on the scatter figures):\n")
 print(asymptote_emmeans[c("channel", "freq", "emmean", "SE", "lower.CL", "upper.CL")],
@@ -1166,7 +1165,6 @@ print(data.frame(channel        = asymptote_tests$channel,
                  t              = round(asymptote_tests$t, 2),
                  df             = round(asymptote_tests$t_df, 1),
                  p              = signif(asymptote_tests$p, 3),
-                 slope_per_hz   = signif(asymptote_tests$slope_per_hz, 3),
                  slope_per_10hz = signif(asymptote_tests$slope_per_10hz, 3),
                  f              = signif(asymptote_tests$f, 3)),
       row.names = FALSE)
@@ -1185,8 +1183,6 @@ asymptote_diagnostics <- function(model, label) {
   plot(simres)
   print(testOutliers(simres))
 }
-
-# WARNING: may throw figure margin error depending on your display. Comment out or use knit function.
 
 asymptote_diagnostics(mod0, "motor (ADMpk2pk)")
 asymptote_diagnostics(mod1, "sensory (filtSNAPpk2pk)")

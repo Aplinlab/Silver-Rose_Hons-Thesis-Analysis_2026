@@ -413,9 +413,9 @@ dc_asymptote_emmeans <- do.call(rbind, lapply(names(dc_asymptote_models), functi
   s
 }))
 
-# lmerTest's anova: Satterthwaite df.
+# lmerTest's anova with Kenward-Roger df, as emmeans uses.
 dc_asymptote_tests <- do.call(rbind, lapply(names(dc_asymptote_models), function(ch) {
-  a <- anova(dc_asymptote_models[[ch]])
+  a <- anova(dc_asymptote_models[[ch]], ddf = "Kenward-Roger")
   data.frame(channel = ch,
              f      = a[["F value"]][1],
              num_df = a[["NumDF"]][1],
@@ -825,7 +825,7 @@ for (ch in dc_figure_channels) {
                                   "in the text\n",
                                   "top right: omnibus F test of the DC term in ",
                                   "lmer(~ DC + (1|subjID)) ",
-                                  "(Satterthwaite df);\npairwise contrasts between conditions ",
+                                  "(Kenward-Roger df);\npairwise contrasts between conditions ",
                                   "are reported in the text, not on the figure%s"),
                            dc_asymptote_window_s, length(unique(df$subjID)),
                            if (has_break)
@@ -1097,9 +1097,6 @@ end-of-train model.
 
 ```{r asymptote-model-diagnostics}
 # Prints diagnostics, the omnibus test and pairwise contrasts per end-of-train model.
-
-# WARNING: may throw figure margin error depending on your display. Comment out or work use knit function.
-
 for (ch in dc_figure_channels) {
   m <- dc_asymptote_models[[ch]]
   cat("\n================ ", dc_channel_labels[[ch]], " ================\n", sep = "")
@@ -1108,7 +1105,7 @@ for (ch in dc_figure_channels) {
   dc_asymptote_simres <- simulateResiduals(m)
   plot(dc_asymptote_simres)
   print(testOutliers(dc_asymptote_simres))
-  print(anova(m))
+  print(anova(m, ddf = "Kenward-Roger"))
   print(emmeans(m, pairwise ~ DC))
 }
 ```
